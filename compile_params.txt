@@ -1,0 +1,4 @@
+OPENEXR_DLL
+remove HALF_EXPORTS
+compile: /D "NOMINMAX" /D "PY_OPENVDB_USE_NUMPY" 
+link: /force:multiple

@@ -69,6 +69,12 @@
 #include "openvdb/tools/Prune.h"
 #include "openvdb/tools/SignedFloodFill.h"
 #include "openvdb/tools/Filter.h"
+#include "openvdb/tools/Composite.h"
+#include "openvdb/tools/GridTransformer.h"
+#include "openvdb/tools/GridOperators.h"
+#include "openvdb/tree/LeafManager.h"
+#include "openvdb/points/AttributeArray.h"
+#include "openvdb/points/PointDataGrid.h"
 
 #include "pyutil.h"
 #include "pyAccessor.h" // for pyAccessor::AccessorWrap
@@ -80,6 +86,48 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <tbb/parallel_for.h>
+#include <tbb/atomic.h>
+
+
+#define INVALID_IDX 0xFFFFFFFF
+
+// const uint32_t INVALID_IDX = 0xFFFFFFFF;
+
+// static const Coord COORD_OFFSETS[26] =
+// {
+// 	Coord(1,  0,  0), /// Voxel-face adjacent neghbours
+// 	Coord(-1,  0,  0), /// 0 to 5
+// 	Coord(0,  1,  0),
+// 	Coord(0, -1,  0),
+// 	Coord(0,  0,  1),
+// 	Coord(0,  0, -1),
+// 	Coord(1,  0, -1), /// Voxel-edge adjacent neghbours
+// 	Coord(-1,  0, -1), /// 6 to 17
+// 	Coord(1,  0,  1),
+// 	Coord(-1,  0,  1),
+// 	Coord(1,  1,  0),
+// 	Coord(-1,  1,  0),
+// 	Coord(1, -1,  0),
+// 	Coord(-1, -1,  0),
+// 	Coord(0, -1,  1),
+// 	Coord(0, -1, -1),
+// 	Coord(0,  1,  1),
+// 	Coord(0,  1, -1),
+// 	Coord(-1, -1, -1), /// Voxel-corner adjacent neghbours
+// 	Coord(-1, -1,  1), /// 18 to 25
+// 	Coord(1, -1,  1),
+// 	Coord(1, -1, -1),
+// 	Coord(-1,  1, -1),
+// 	Coord(-1,  1,  1),
+// 	Coord(1,  1,  1),
+// 	Coord(1,  1, -1)
+// };
+
+#define PI 3.141592653589793f
+#define EE 2.718281828459045f
+#define PISQRT 2.5066282746310002f
 
 namespace py = boost::python;
 
@@ -233,6 +281,34 @@ extractValueArg(
     return extractValueArg<GridType, typename GridType::ValueType>(
         obj, functionName, argIdx, expectedType);
 }
+
+
+// template<typename GridT, typename MaskT, typename InterruptT>
+// template<size_t Axis>
+// inline typename GridT::ValueType
+// Filter<GridT, MaskT, InterruptT>::AvgI<Axis>::operator()(Coord xyz)
+// {
+// 	// Sampled Gaussian kernel
+// 	ValueType sum = zeroVal<ValueType>();
+// 	float multiplier = 0.f, error = 0.f;
+// 	//float sigma = std::sqrt((float)width / 4.0f);
+// 	// M = C*sqrt(t) + 1
+// 	//int M = (int)(5.0f * sigma + 1.0f);
+// 	int M = width;
+
+// 	Int32 &i = xyz[Axis], j = i + M;
+// 	Int32 center = i;
+
+// 	for (i -= M; i <= j; ++i) {
+// 		// G(x) = 1/sqrt(2*PI)/sigma * e ** -(x**2/(2*sigma**2))
+// 		Int32 x = i - center;
+// 		multiplier = 1.f / PISQRT / sigma * std::pow(EE, -x*x / (2 * sigma*sigma));
+// 		error += multiplier;
+// 		filter_internal::accum(sum, multiplier * acc.getValue(xyz));
+// 	}
+// 	//return static_cast<ValueType>(sum / error);
+// 	return static_cast<ValueType>(sum);
+// }
 
 
 ////////////////////////////////////////
@@ -1401,8 +1477,9 @@ meshToLevelSet(py::object pointsObj, py::object trianglesObj, py::object quadsOb
 }
 
 
-//template<typename GridType>
-//inline typename GridType::Ptr
+// amb: Extending OpenVDB Python functionality
+
+
 template<typename GridType>
 inline openvdb::FloatGrid::Ptr
 pointsToLevelSet(
@@ -1421,7 +1498,8 @@ pointsToLevelSet(
 		}
 
 		using PosType = openvdb::Vec3R;
-		// Return the total number of particles in list.
+		
+        // Return the total number of particles in list.
 		// Always required!
 		size_t size() const {
 			return points->size();
@@ -1552,106 +1630,267 @@ pointsToLevelSet(
 }
 
 
-// Extending OpenVDB Python functionality
 
 template<typename GridType>
-inline py::object
-volumeToComplexMesh(GridType& grid, py::object isovalueObj, 
-	py::object adaptivityObj,
+inline void
+smooth(GridType& grid,
 	py::object smoothvalueObj,
-	py::object widthObj,
-	py::object sigmaObj
-	)
+	py::object widthObj)
 {
-	const double isovalue = pyutil::extractArg<double>(
-		isovalueObj, "convertToComplex", /*className=*/nullptr, /*argIdx=*/2, "float");
-
-	const double adaptivity = pyutil::extractArg<double>(
-		adaptivityObj, "convertToComplex", /*className=*/nullptr, /*argIdx=*/3, "float");
-
 	const int smooth = pyutil::extractArg<int>(
-		smoothvalueObj, "convertToComplex", /*className=*/nullptr, /*argIdx=*/4, "int");
+		smoothvalueObj, "smooth", /*className=*/nullptr, /*argIdx=*/4, "int");
 
-	const double width = pyutil::extractArg<int>(
-		widthObj, "convertToComplex", /*className=*/nullptr, /*argIdx=*/5, "int");
-
-	const double sigma = pyutil::extractArg<double>(
-		sigmaObj, "convertToComplex", /*className=*/nullptr, /*argIdx=*/6, "float");
-
-	// Mesh the input grid and populate lists of mesh vertices and face vertex indices.
-	std::vector<Vec3s> points;
-	std::vector<Vec4I> quads;
-	std::vector<Vec3I> triangles;
+	const int width = pyutil::extractArg<int>(
+		widthObj, "smooth", /*className=*/nullptr, /*argIdx=*/5, "int");
 
 	// Gaussian smoothing
 	openvdb::tools::Filter<GridType> filter(grid);
 	
 	if (smooth > 0) {
-		filter.gaussian(width, smooth, sigma);
+		filter.gaussian(width, smooth);
 	}
-
-	tools::volumeToMesh(grid, points, triangles, quads, isovalue, adaptivity);
-
-#ifdef PY_OPENVDB_USE_BOOST_PYTHON_NUMPY
-    const py::object own;
-    auto dtype = py::numpy::dtype::get_builtin<Vec3s::value_type>();
-    auto shape = py::make_tuple(points.size(), 3);
-    auto stride = py::make_tuple(3 * sizeof(Vec3s::value_type), sizeof(Vec3s::value_type));
-    // Create a deep copy of the array (because the point vector will be destroyed
-    // when this function returns).
-    auto pointArrayObj = py::numpy::from_data(points.data(), dtype, shape, stride, own).copy();
-
-    dtype = py::numpy::dtype::get_builtin<Vec3I::value_type>();
-    shape = py::make_tuple(triangles.size(), 3);
-    stride = py::make_tuple(3 * sizeof(Vec3I::value_type), sizeof(Vec3I::value_type));
-    auto triangleArrayObj = py::numpy::from_data(
-        triangles.data(), dtype, shape, stride, own).copy(); // deep copy
-
-    dtype = py::numpy::dtype::get_builtin<Vec4I::value_type>();
-    shape = py::make_tuple(quads.size(), 4);
-    stride = py::make_tuple(4 * sizeof(Vec4I::value_type), sizeof(Vec4I::value_type));
-    auto quadArrayObj = py::numpy::from_data(
-        quads.data(), dtype, shape, stride, own).copy(); // deep copy
-#else // !defined PY_OPENVDB_USE_BOOST_PYTHON_NUMPY
-    // Copy vertices into an N x 3 NumPy array.
-    py::object pointArrayObj = py::numeric::array(py::list(), "float32");
-    if (!points.empty()) {
-        npy_intp dims[2] = { npy_intp(points.size()), 3 };
-        // Construct a NumPy array that wraps the point vector.
-        if (PyArrayObject* arrayObj = reinterpret_cast<PyArrayObject*>(
-            PyArray_SimpleNewFromData(/*dims=*/2, dims, NPY_FLOAT, &points[0])))
-        {
-            // Create a deep copy of the array (because the point vector will be
-            // destroyed when this function returns).
-            pointArrayObj = copyNumPyArray(arrayObj, NPY_CORDER);
-        }
-    }
-
-    // Copy triangular face indices into an N x 3 NumPy array.
-    py::object triangleArrayObj = py::numeric::array(py::list(), "uint32");
-    if (!triangles.empty()) {
-        npy_intp dims[2] = { npy_intp(triangles.size()), 3 };
-        if (PyArrayObject* arrayObj = reinterpret_cast<PyArrayObject*>(
-            PyArray_SimpleNewFromData(/*dims=*/2, dims, NPY_UINT32, &triangles[0])))
-        {
-            triangleArrayObj = copyNumPyArray(arrayObj, NPY_CORDER);
-        }
-    }
-
-    // Copy quadrilateral face indices into an N x 4 NumPy array.
-    py::object quadArrayObj = py::numeric::array(py::list(), "uint32");
-    if (!quads.empty()) {
-        npy_intp dims[2] = { npy_intp(quads.size()), 4 };
-        if (PyArrayObject* arrayObj = reinterpret_cast<PyArrayObject*>(
-            PyArray_SimpleNewFromData(/*dims=*/2, dims, NPY_UINT32, &quads[0])))
-        {
-            quadArrayObj = copyNumPyArray(arrayObj, NPY_CORDER);
-        }
-    }
-#endif // PY_OPENVDB_USE_BOOST_PYTHON_NUMPY
-
-	return py::make_tuple(pointArrayObj, triangleArrayObj, quadArrayObj);
 }
+
+
+template<typename GridType>
+inline void
+offset(GridType& grid,
+	py::object offsetObj)
+{
+    using ValueType = typename GridType::ValueType;
+	const float oset_val = pyutil::extractArg<float>(
+		offsetObj, "offset", /*className=*/nullptr, /*argIdx=*/1, "float");
+
+	// offset
+	openvdb::tools::Filter<GridType> filter(grid);
+	
+    filter.offset(static_cast<ValueType>(oset_val));
+}
+
+
+template<typename GridType>
+struct GaussianOp
+{
+    using ValueType = typename GridType::ValueType;
+    using TreeType = typename GridType::TreeType;
+    using Accessor = tree::ValueAccessor<const TreeType>;
+
+    GaussianOp(const TreeType& tree, int width, double sigma)
+        : mTreeAcc(tree), mWidth(width), mSigma(sigma) {}
+
+    int mWidth;
+    double mSigma;
+    Accessor mTreeAcc;
+
+    template <typename LeafNodeType>
+    void operator()(LeafNodeType &leaf, size_t) const
+    {
+        typename LeafNodeType::ValueOnIter iter = leaf.beginValueOn();
+        for (; iter; ++iter) {
+            ValueType total_sum = zeroVal<ValueType>();
+
+            for (int axis=0; axis<3; axis++) {
+                ValueType sum = zeroVal<ValueType>();
+                Coord xyz = iter.getCoord();
+
+                // Sampled Gaussian kernel
+                float multiplier = 0.f; //, error = 0.f;
+                int M = mWidth;
+
+                Int32 &i = xyz[axis], j = i + M;
+                Int32 center = i;
+                
+                for (i -= M; i <= j; ++i) {
+                    // G(x) = 1/sqrt(2*PI)/sigma * e ** -(x**2/(2*sigma**2))
+                    Int32 x = i - center;
+                    multiplier = 1.f / PISQRT / mSigma * std::pow(EE, -x*x / (2 * mSigma*mSigma));
+                    sum += multiplier * mTreeAcc.getValue(xyz);
+                }
+
+                total_sum += sum;
+            }
+
+            iter.setValue(total_sum/3);
+        }
+    }
+};
+
+
+template<typename GridT>
+inline void
+gaussianSmooth(GridT& grid,
+	py::object smoothvalueObj,
+	py::object widthObj)
+{
+    using GridType = GridT;
+    using TreeType = typename GridType::TreeType;
+    using LeafType = typename TreeType::LeafNodeType;
+    using ValueType = typename GridType::ValueType;
+    using LeafManagerType = typename tree::LeafManager<TreeType>;
+    using RangeType = typename LeafManagerType::LeafRange;
+    using BufferType = typename LeafManagerType::BufferType;
+    using ValueOnIterType = typename GridType::ValueOnIter;
+    using ValueOnCIterType = typename GridType::ValueOnCIter;
+    using ValueOffIterType = typename GridType::ValueOffIter;
+    using LeafCIterType = typename TreeType::LeafCIter;
+    // using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
+    using RangeType = typename LeafManagerType::LeafRange;
+
+
+	double sigma = pyutil::extractArg<double>(
+		smoothvalueObj, "gaussian", /*className=*/nullptr, /*argIdx=*/1, "double");
+
+	int width = pyutil::extractArg<int>(
+		widthObj, "gaussian", /*className=*/nullptr, /*argIdx=*/2, "int");
+
+
+    // sanity check
+    sigma = std::max(0.1, sigma);
+    width = std::min(width, 10);
+
+
+    # if 0
+
+    TreeType the_tree = grid.tree();
+    // separated 3 x 1D Gaussian kernel
+    for (ValueOnIterType iter = grid.beginValueOn(); iter; ++iter) {
+    // for (LeafCIterType iter = grid.tree().cbeginLeaf(); iter; ++iter) {
+        ValueType total_sum = zeroVal<ValueType>();
+
+        for (int axis=0; axis<3; axis++) {
+            ValueType sum = zeroVal<ValueType>();
+            Coord xyz = iter.getCoord();
+
+            // Sampled Gaussian kernel
+            float multiplier = 0.f; //, error = 0.f;
+            int M = width;
+
+            Int32 &i = xyz[axis], j = i + M;
+            Int32 center = i;
+            
+            for (i -= M; i <= j; ++i) {
+                // G(x) = 1/sqrt(2*PI)/sigma * e ** -(x**2/(2*sigma**2))
+                Int32 x = i - center;
+                multiplier = 1.f / PISQRT / sigma * std::pow(EE, -x*x / (2 * sigma*sigma));
+                sum += multiplier * the_tree.getValue(xyz);
+            }
+
+            total_sum += sum;
+        }
+
+        iter.setValue(total_sum/3);
+    }
+
+    # else
+
+    int grainsize = 1; // multithreading
+    LeafManagerType leafs(grid.tree(), 1, grainsize==0);
+
+    GaussianOp<GridType> proc(grid.tree(), width, sigma);
+
+    leafs.foreach(proc);
+
+    // tbb::parallel_for(leafs.leafRange(), proc);
+    // leafs.swapLeafBuffer(1, grainsize==0);
+
+    # endif
+}
+
+// template<typename GridType>
+// //inline void
+// inline typename GridType::Ptr
+// applyTransform(GridType& grid)
+// {
+//     // if (grid.transform().isLinear())  {
+//     openvdb::math::Transform::Ptr linearTransform =
+//         openvdb::math::Transform::createLinearTransform(mat);
+
+//     // typename GridType::Ptr gridB = grid.copy(CP_NEW);
+//     typename GridType::Ptr gridB = grid.deepCopy();
+//     gridB->setTransform(linearTransform);
+
+//     // tools::resampleToMatch<tools::PointSampler>(grid, *gridB);
+
+//     const openvdb::math::Transform
+//         &sourceXform = grid.transform(),
+//         &targetXform = gridB->transform();
+
+//     openvdb::Mat4R xform =
+//         sourceXform.baseMap()->getAffineMap()->getMat4() *
+//         targetXform.baseMap()->getAffineMap()->getMat4().inverse();
+
+//     openvdb::Mat4R xform = grid.transform().baseMap()->getAffineMap()->getMat4().inverse();
+
+//     openvdb::tools::GridTransformer transformer(xform);
+//     transformer.transformGrid<openvdb::tools::PointSampler, GridType>(grid, *gridB);
+
+//     gridB->tree().prune();
+
+//     return gridB;
+// }
+
+
+template<typename GridType>
+inline void
+csgIntersection(GridType& grid, py::object otherGridObj, bool resample)
+{
+    using GridPtr = typename GridType::Ptr;
+    GridPtr otherGrid = extractValueArg<GridType, GridPtr>(otherGridObj,
+        "intersection", 1, pyutil::GridTraits<GridType>::name());
+
+    if (resample) {
+        typename GridType::Ptr gridB = grid.deepCopy();
+        gridB->setTransform(grid.transform().copy());
+
+        tools::resampleToMatch<tools::PointSampler>(*otherGrid, *gridB);
+        openvdb::tools::csgIntersection(grid, *gridB);
+    } else {
+        openvdb::tools::csgIntersection(grid, *otherGrid);
+    }
+}
+
+template<typename GridType>
+inline void
+csgUnion(GridType& grid, py::object otherGridObj, bool resample)
+{
+    using GridPtr = typename GridType::Ptr;
+    GridPtr otherGrid = extractValueArg<GridType, GridPtr>(otherGridObj,
+        "union", 1, pyutil::GridTraits<GridType>::name());
+
+    if (resample) {
+        typename GridType::Ptr gridB = grid.deepCopy();
+        gridB->setTransform(grid.transform().copy());
+
+        tools::resampleToMatch<tools::PointSampler>(*otherGrid, *gridB);
+        openvdb::tools::csgUnion(grid, *gridB);
+    } else {
+        openvdb::tools::csgUnion(grid, *otherGrid);
+    }
+
+}
+
+template<typename GridType>
+inline void
+csgDifference(GridType& grid, py::object otherGridObj, bool resample)
+{
+    using GridPtr = typename GridType::Ptr;
+    GridPtr otherGrid = extractValueArg<GridType, GridPtr>(otherGridObj,
+        "difference", 1, pyutil::GridTraits<GridType>::name());
+
+    if (resample) {
+        typename GridType::Ptr gridB = grid.deepCopy();
+        gridB->setTransform(grid.transform().copy());
+
+        tools::resampleToMatch<tools::PointSampler>(*otherGrid, *gridB);
+        openvdb::tools::csgDifference(grid, *gridB);
+    } else {
+        openvdb::tools::csgDifference(grid, *otherGrid);
+    }
+}
+
+
+
+// amb: end
 
 
 template<typename GridType>
@@ -2639,24 +2878,34 @@ exportGrid()
                 + std::string(openvdb::VecTraits<ValueT>::IsVec ? "four" : "three")
                 + "-dimensional array with values\n"
                 "from this grid, starting at voxel (i, j, k).").c_str())
-			.def("convertToComplex",
-				&pyGrid::volumeToComplexMesh<GridType>,
-				(py::arg("isovalue") = 0, 
-					py::arg("adaptivity") = 0,
-					py::arg("smooth") = 0,
-					py::arg("width") = 1,
-					py::arg("sigma") = 2.0
-					),
-				"convertToComplex(isovalue=0, adaptivity=0, smooth=0, width=1) -> points, quads\n\n"
-				"First do a Gaussian filtering on the grid.\n\n"
-				"Then adaptively mesh a scalar grid that has a continuous isosurface\n"
-				"at the given isovalue.  Return a NumPy array of world-space\n"
-				"points and NumPy arrays of 3- and 4-tuples of point indices,\n"
-				"which specify the vertices of the triangles and quadrilaterals\n"
-				"that form the mesh.  Adaptivity can vary from 0 to 1, where 0\n"
-				"produces a high-polygon-count mesh that closely approximates\n"
-				"the isosurface, and 1 produces a lower-polygon-count mesh\n"
-				"with some loss of surface detail.")
+
+            .def("smooth", &pyGrid::smooth<GridType>, 
+                (py::arg("smooth") = 0, py::arg("width") = 1),
+                "Normal smoothing")
+
+            .def("offset", &pyGrid::offset<GridType>, 
+                (py::arg("offset") = 0.0),
+                "Surface offset")
+
+            .def("gaussian", &pyGrid::gaussianSmooth<GridType>, 
+                (py::arg("sigma") = 1.0, py::arg("width") = 1),
+                "Gaussian smoothing")
+
+            // .def("applyTransform", &pyGrid::applyTransform<GridType>, 
+            //     "Apply transform, resample VDB data")
+
+            .def("intersection", &pyGrid::csgIntersection<GridType>, 
+                (py::arg("grid"), py::arg("resample")=false),
+                "CSG Intersection")
+
+            .def("union", &pyGrid::csgUnion<GridType>, 
+                (py::arg("grid"), py::arg("resample")=false),
+                "CSG Union")
+
+            .def("difference", &pyGrid::csgDifference<GridType>, 
+                (py::arg("grid"), py::arg("resample")=false),
+                "CSG Difference")
+
             .def("convertToQuads",
                 &pyGrid::volumeToQuadMesh<GridType>,
                 (py::arg("isovalue")=0),

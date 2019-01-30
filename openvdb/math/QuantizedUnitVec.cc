@@ -30,6 +30,12 @@
 
 #include "QuantizedUnitVec.h"
 
+
+#ifdef WIN32
+
+#else
+
+
 namespace openvdb {
 OPENVDB_USE_VERSION_NAMESPACE
 namespace OPENVDB_VERSION_NAME {
@@ -2104,9 +2110,13 @@ float QuantizedUnitVec::sNormalizationWeights[8192] = {
     0.01148136612f, 0.0113960579f, 0.01130972803f, 0.01122250315f
 };
 
+
 } // namespace math
 } // namespace OPENVDB_VERSION_NAME
 } // namespace openvdb
+
+#endif
+
 
 // Copyright (c) 2012-2018 DreamWorks Animation LLC
 // All rights reserved. This software is distributed under the
