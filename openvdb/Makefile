@@ -85,7 +85,8 @@
 # $(BOOST_PYTHON_LIB) and $(NUMPY_INCL_DIR) below to your local distributions
 # of those libraries.
 #
-shared=no
+debug=no
+shared=yes
 # The directory into which to install libraries, executables and header files
 DESTDIR := /tmp/OpenVDB
 
