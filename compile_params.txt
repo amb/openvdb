@@ -1,4 +1,7 @@
-OPENEXR_DLL
+shared dll:
+add OPENEXR_DLL
 remove HALF_EXPORTS
-compile: /D "NOMINMAX" /D "PY_OPENVDB_USE_NUMPY" 
+
+compile: /D "NOMINMAX" /D "PY_OPENVDB_USE_NUMPY" /bigobj
+
 link: /force:multiple
